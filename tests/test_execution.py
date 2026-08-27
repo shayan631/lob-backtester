@@ -16,9 +16,10 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import itertools
 from dataclasses import dataclass
 
-from backtest.execution import EngineExecutionClient, book_snapshot_from_engine
+from backtest.execution import EngineExecutionClient, book_snapshot_from_engine, _EngineOrder
 from strategy.base import Fill, Side
 
 
@@ -206,3 +207,79 @@ def test_book_snapshot_from_engine_builds_snapshot_once_both_sides_exist():
     assert snap.bid_size == 10
     assert snap.ask_size == 7
     assert snap.mid == 100.0
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the order-id-collision bug flagged in review: the
+# original EngineExecutionClient had its own PRIVATE itertools.count(1),
+# so any two independent id sources feeding the same OrderBook (e.g. a
+# historical order and the strategy's own first order) could both hand
+# out id=1, silently corrupting whichever order got overwritten and
+# leaving it uncancellable through the normal API.
+# ---------------------------------------------------------------------------
+
+def test_default_id_shim_is_shared_across_client_instances():
+    """
+    Two EngineExecutionClient instances with no explicit order_id_factory
+    should NOT hand out the same first id -- the default shim is
+    module-level now, not per-instance.
+    """
+    book = FakeOrderBook()
+    client_a = EngineExecutionClient(book, [None])
+    client_b = EngineExecutionClient(book, [None])
+
+    id_a = client_a.submit_order(Side.BUY, price=99.0, qty=5)
+    id_b = client_b.submit_order(Side.SELL, price=105.0, qty=5)
+
+    assert id_a != id_b
+
+
+def test_shared_id_factory_prevents_historical_and_strategy_orders_colliding():
+    """
+    This is the scenario from review, but fixed: a historical order and
+    the strategy's own order both pull ids from ONE shared factory (what
+    engine.next_order_id() is for), so they can never collide, and
+    cancelling our own order never touches the historical one.
+    """
+    shared_counter = itertools.count(1)
+
+    def shared_next_id():
+        return next(shared_counter)
+
+    book = FakeOrderBook()
+    historical_id = shared_next_id()
+    book.add_limit_order(
+        _EngineOrder(id=historical_id, side="buy", price=99.0, quantity=10, timestamp=1)
+    )
+
+    client = EngineExecutionClient(book, [None], order_id_factory=shared_next_id)
+    strategy_order_id = client.submit_order(Side.SELL, price=105.0, qty=5)
+
+    assert int(strategy_order_id) != historical_id
+
+    client.cancel_order(strategy_order_id)
+    assert book.best_bid() == 99.0  # historical bid untouched
+    assert book.best_ask() is None  # our ask is the one that got cancelled
+
+
+def test_unshared_id_factories_collide_documents_the_original_bug():
+    """
+    Documents the failure mode the fix exists to prevent -- NOT something
+    we want. If a historical order is fed in via its own counter starting
+    at 1, and the strategy's client is (deliberately, for this test) given
+    its own separate counter that ALSO starts at 1, they collide: the
+    strategy's order silently reuses the historical order's id, and
+    cancelling "our" order actually removes the historical one instead.
+    """
+    book = FakeOrderBook()
+    book.add_limit_order(_EngineOrder(id=1, side="buy", price=99.0, quantity=10, timestamp=1))
+
+    unshared_counter = itertools.count(1)
+    client = EngineExecutionClient(book, [None], order_id_factory=lambda: next(unshared_counter))
+    strategy_order_id = client.submit_order(Side.SELL, price=105.0, qty=5)
+
+    assert strategy_order_id == "1"  # collided with the historical order's id
+
+    client.cancel_order(strategy_order_id)
+    assert book.best_bid() is None  # wrong! the historical bid is what got removed
+    assert book.best_ask() == 105.0  # our order is still resting, now orphaned

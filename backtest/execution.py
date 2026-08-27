@@ -1,19 +1,19 @@
 """
-Adapter that lets a Strategy (strategy/base.py) run against the real
-matching engine once it exists, instead of strategy/toy_book.py's fake
-fill logic.
+Adapter that lets a Strategy actually do buy and sell type shit against a
+REAL order book, instead of the fake fills from toy_book.py.
 
-Why this is written the way it is
+Why it's written the way it is
 ----------------------------------
-As of this writing, engine-core (the other branch) only has
-engine/order.py (Order, Trade dataclasses) committed. engine.OrderBook
-itself -- add_limit_order() / cancel_order() / best_bid() / best_ask() /
-snapshot() -- is not implemented yet, though engine-core's own
-tests/test_engine.py already documents the exact interface it will have.
+Right now (as of writing this), engine-core only has engine/order.py
+(Order, Trade dataclasses) done. The actual OrderBook -- add_limit_order(),
+cancel_order(), best_bid(), best_ask(), snapshot() -- isn't built yet.
+BUT their own tests/test_engine.py already spells out exactly what that
+interface is gonna look like, so we're coding against that.
 
-Rather than `from engine import Order, OrderBook` (which would break this
-branch right now, since engine/ doesn't exist here), this module is
-written against that interface as a structural/duck-typed contract:
+Can't do `from engine import Order, OrderBook` because engine/ doesn't
+even exist on this branch yet -- that import would just explode. So
+instead this file fakes the shape of it (duck typing, basically "if it
+quacks like an OrderBook, we don't care what it actually is"):
 
     Order-like:     id, side ("buy"/"sell"), price, quantity, timestamp
     OrderBook-like: add_limit_order(order) -> list[Trade]
@@ -24,12 +24,11 @@ written against that interface as a structural/duck-typed contract:
                                     "asks": [(price, qty), ...]}
     Trade-like:      buy_order_id, sell_order_id, price, quantity, timestamp
 
-Once engine-core is merged into this branch:
-    1. Delete the `_EngineOrder` shim below.
-    2. Replace it with `from engine.order import Order as _EngineOrder`.
-    3. Everything else in this file should keep working unchanged --
-       that's the whole point of coding against the interface instead of
-       the concrete class.
+Once engine-core actually gets merged into this branch:
+    1. Yeet the `_EngineOrder` shim below.
+    2. Swap it for `from engine.order import Order as _EngineOrder`.
+    3. Nothing else here should need to change -- that's the whole point
+       of coding against the interface instead of some hardcoded class.
 """
 
 from __future__ import annotations
@@ -42,8 +41,47 @@ from strategy.base import BookSnapshot, ExecutionClient, Fill, Side
 
 
 # ---------------------------------------------------------------------------
-# Shim -- delete once engine/order.py exists on this branch (see docstring).
+# Shim -- delete once engine/order.py (and engine/__init__.py, once that
+# exists too) shows up on this branch.
+#
+# IMPORTANT -- this is exactly the piece that needs to change carefully.
+# The original version of this file used a PRIVATE itertools.count(1) on
+# EngineExecutionClient itself. That's a real bug: engine/order.py already
+# defines a shared next_order_id() specifically so every order in the
+# system pulls from ONE counter. Two independent counters that both start
+# at 1 will collide the instant they both feed orders into the same
+# OrderBook -- e.g. a historical order gets id 1, then our own first
+# submit_order() also generates id 1, silently overwriting the historical
+# order's spot in order_locations. Cancelling "our" order 1 then cancels
+# the wrong thing, and the historical order is orphaned on the book with
+# no way to reference it again. No error, no warning -- it just quietly
+# does the wrong thing.
+#
+# Fix: route order id generation through one function, injected in here,
+# instead of a counter owned by this class. Once engine-core is merged:
+#   from engine import next_order_id
+#   EngineExecutionClient(order_book, holder, order_id_factory=next_order_id)
+# and make sure the historical data loader (Phase 2) calls next_order_id()
+# too, rather than reusing LOBSTER's raw order ids directly -- those
+# aren't guaranteed to avoid collision with ids generated on our side
+# either.
 # ---------------------------------------------------------------------------
+_local_id_counter = itertools.count(1)
+
+
+def _next_order_id_shim() -> int:
+    """
+    Local stand-in for engine.next_order_id(). This is module-level (not
+    per-instance), so multiple EngineExecutionClient objects in the same
+    process at least won't collide with EACH OTHER by default -- but it's
+    still a separate counter from anything else in the system (e.g. a
+    data loader) until everyone's wired up to the real shared one. Delete
+    this once engine-core is merged in and pass the real next_order_id as
+    order_id_factory instead.
+    """
+    return next(_local_id_counter)
+
+
 @dataclass
 class _EngineOrder:
     id: int
@@ -55,7 +93,7 @@ class _EngineOrder:
 
 @runtime_checkable
 class OrderBookProtocol(Protocol):
-    """Structural contract for whatever engine-core's OrderBook exposes."""
+    """Whatever engine-core's real OrderBook ends up being, it needs to at least do this."""
 
     def add_limit_order(self, order: Any) -> list: ...
     def cancel_order(self, order_id: int) -> bool: ...
@@ -66,36 +104,42 @@ class OrderBookProtocol(Protocol):
 
 class EngineExecutionClient(ExecutionClient):
     """
-    Wraps a real (or real-shaped) OrderBook so a Strategy can trade
-    against it through the same ExecutionClient interface it already
-    uses with ToyExecutionClient -- Strategy subclasses need zero changes
-    to run against this instead.
+    Wraps a real (or real-shaped) OrderBook so a Strategy can go do its
+    buy and sell type shit against it the exact same way it already does
+    with ToyExecutionClient -- Strategy subclasses don't need to change
+    a single line to run against this instead.
 
-    Usage mirrors toy_book.ToyExecutionClient:
+    Used basically the same way as toy_book.ToyExecutionClient:
 
         strategy_holder = [None]
         execution = EngineExecutionClient(order_book, strategy_holder)
         strategy = SimpleMarketMaker(execution, ...)
         strategy_holder[0] = strategy
 
-    One thing the toy client didn't need to handle: a resting order can
-    get filled later by *someone else's* order (e.g. a historical/replayed
-    order fed into the book by the backtest loop), not just by the order
-    the strategy itself just submitted. Call apply_trades() with whatever
-    Trade list the engine returns from any add_limit_order() call -- ours
-    or an external one -- so those fills also reach the strategy.
+    One thing the toy client never had to deal with: a resting order can
+    get filled way later by SOMEONE ELSE'S order (like a historical order
+    getting replayed into the book by the backtest loop), not just by
+    whatever we just submitted ourselves. So call apply_trades() with
+    whatever Trade list the engine hands back from ANY add_limit_order()
+    call -- ours or somebody else's -- so those fills still make it back
+    to the strategy.
     """
 
-    def __init__(self, order_book: OrderBookProtocol, strategy_ref_holder: list):
+    def __init__(
+        self,
+        order_book: OrderBookProtocol,
+        strategy_ref_holder: list,
+        order_id_factory=_next_order_id_shim,
+    ):
         self._book = order_book
         self._strategy_holder = strategy_ref_holder
-        self._id_counter = itertools.count(1)
-        # Only orders THIS client submitted -- used to recognize which
-        # trades belong to our strategy when apply_trades() is called.
+        self._next_order_id = order_id_factory
+        # only tracking OUR OWN orders here -- how we know which trades
+        # are actually "ours" when apply_trades() gets called
         self._our_order_sides: dict[int, Side] = {}
 
     def submit_order(self, side: Side, price: float, qty: float) -> str:
-        order_id = next(self._id_counter)
+        order_id = self._next_order_id()
         order = _EngineOrder(
             id=order_id,
             side=side.value,
@@ -114,16 +158,18 @@ class EngineExecutionClient(ExecutionClient):
         self._our_order_sides.pop(oid, None)
 
     def cancel_all(self) -> None:
+        # nuke everything we've got resting
         for oid in list(self._our_order_sides):
             self.cancel_order(str(oid))
 
     def apply_trades(self, trades: list) -> None:
         """
-        Feed a batch of Trade objects through this client so fills on our
-        resting orders reach the strategy via on_fill(). Safe to call with
-        trades that don't involve us at all -- those are ignored. The
-        backtest replay loop should call this after every add_limit_order()
-        it makes on the shared book, not just the ones this client made.
+        Feed it a batch of Trades and it'll ping the strategy's on_fill()
+        for any of OUR resting orders that got hit. Trades that have
+        nothing to do with us just get ignored, no harm done. The backtest
+        replay loop should be calling this after literally every
+        add_limit_order() it does on the shared book, not just the ones
+        that came from this client.
         """
         strategy = self._strategy_holder[0]
         for trade in trades:
@@ -146,13 +192,13 @@ class EngineExecutionClient(ExecutionClient):
 
 def book_snapshot_from_engine(order_book: OrderBookProtocol, timestamp: float) -> BookSnapshot | None:
     """
-    Build a strategy/base.py BookSnapshot from a real OrderBook.
+    Turns a real OrderBook's raw state into the BookSnapshot shape
+    strategy/base.py actually expects.
 
-    Returns None if either side of the book is currently empty (no valid
-    mid/spread to quote around yet) -- callers should skip the
-    on_book_update() call for that event when this returns None, same as
-    you'd do at the very start of a replay before any resting liquidity
-    exists.
+    Returns None if either side of the book is empty -- no bid or no ask
+    means there's no real mid/spread to quote around yet, so just skip
+    calling on_book_update() for that tick. Happens naturally at the very
+    start of a replay before any resting liquidity has built up.
     """
     best_bid = order_book.best_bid()
     best_ask = order_book.best_ask()

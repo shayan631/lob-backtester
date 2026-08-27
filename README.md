@@ -22,7 +22,9 @@ rather than relying on someone else's implementation.
 `backtest/execution.py` is written against engine-core's `OrderBook`
 interface as a duck-typed contract rather than a hard import, since
 `engine/` isn't on this branch yet. Once engine-core merges in, swap the
-shim `_EngineOrder` for the real `engine.order.Order` — nothing else in
+shim `_EngineOrder` for the real `engine.Order`, and pass `engine.next_order_id`
+as `EngineExecutionClient`'s `order_id_factory` instead of the local shim —
+nothing else in
 that file should need to change. See its docstring for details.
 
 ## Setup
