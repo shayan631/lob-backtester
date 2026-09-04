@@ -30,8 +30,8 @@ class OrderBookProtocol(Protocol):
 
 class EngineExecutionClient(ExecutionClient):
     """
-    Wraps a real (or real-shaped) OrderBook so a Strategy can go do its
-    buy and sell type shit against it the exact same way it already does
+    Wraps OrderBook so  Strategy can go do its
+    buy and sell against it the exact same way it already does
     with ToyExecutionClient -- Strategy subclasses don't need to change
     a single line to run against this instead.
 
