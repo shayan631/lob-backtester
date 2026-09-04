@@ -1,14 +1,11 @@
 """
 Tests for backtest/execution.py.
 
-These use FakeOrderBook, a minimal test double shaped exactly like what
-engine-core's tests/test_engine.py implies OrderBook will look like
-(add_limit_order / cancel_order / best_bid / best_ask / snapshot, with
-price-time priority matching). It is NOT the real engine -- it exists so
-this adapter can be tested and pushed now, independent of engine-core's
-progress. Once the real engine.OrderBook lands, re-point these tests at
-it (or add a second parametrized run against the real thing) to confirm
-the adapter still holds up.
+Most of these use FakeOrderBook, a minimal test double shaped like
+engine.OrderBook's interface (add_limit_order / cancel_order / best_bid /
+best_ask / snapshot). It's kept around even now that the real engine is
+merged in, since it's still handy for isolated adapter tests. The real
+engine.OrderBook is exercised directly in test_integration.py.
 """
 
 import sys
@@ -19,7 +16,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import itertools
 from dataclasses import dataclass
 
-from backtest.execution import EngineExecutionClient, book_snapshot_from_engine, _EngineOrder
+from engine import Order
+
+from backtest.execution import EngineExecutionClient, book_snapshot_from_engine
 from strategy.base import Fill, Side
 
 
@@ -249,7 +248,7 @@ def test_shared_id_factory_prevents_historical_and_strategy_orders_colliding():
     book = FakeOrderBook()
     historical_id = shared_next_id()
     book.add_limit_order(
-        _EngineOrder(id=historical_id, side="buy", price=99.0, quantity=10, timestamp=1)
+        Order(id=historical_id, side="buy", price=99.0, quantity=10, timestamp=1)
     )
 
     client = EngineExecutionClient(book, [None], order_id_factory=shared_next_id)
@@ -272,7 +271,7 @@ def test_unshared_id_factories_collide_documents_the_original_bug():
     cancelling "our" order actually removes the historical one instead.
     """
     book = FakeOrderBook()
-    book.add_limit_order(_EngineOrder(id=1, side="buy", price=99.0, quantity=10, timestamp=1))
+    book.add_limit_order(Order(id=1, side="buy", price=99.0, quantity=10, timestamp=1))
 
     unshared_counter = itertools.count(1)
     client = EngineExecutionClient(book, [None], order_id_factory=lambda: next(unshared_counter))

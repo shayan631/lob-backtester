@@ -2,98 +2,24 @@
 Adapter that lets a Strategy actually do buy and sell type shit against a
 REAL order book, instead of the fake fills from toy_book.py.
 
-Why it's written the way it is
-----------------------------------
-Right now (as of writing this), engine-core only has engine/order.py
-(Order, Trade dataclasses) done. The actual OrderBook -- add_limit_order(),
-cancel_order(), best_bid(), best_ask(), snapshot() -- isn't built yet.
-BUT their own tests/test_engine.py already spells out exactly what that
-interface is gonna look like, so we're coding against that.
-
-Can't do `from engine import Order, OrderBook` because engine/ doesn't
-even exist on this branch yet -- that import would just explode. So
-instead this file fakes the shape of it (duck typing, basically "if it
-quacks like an OrderBook, we don't care what it actually is"):
-
-    Order-like:     id, side ("buy"/"sell"), price, quantity, timestamp
-    OrderBook-like: add_limit_order(order) -> list[Trade]
-                    cancel_order(order_id) -> bool
-                    best_bid() -> float | None
-                    best_ask() -> float | None
-                    snapshot() -> {"bids": [(price, qty), ...],
-                                    "asks": [(price, qty), ...]}
-    Trade-like:      buy_order_id, sell_order_id, price, quantity, timestamp
-
-Once engine-core actually gets merged into this branch:
-    1. Yeet the `_EngineOrder` shim below.
-    2. Swap it for `from engine.order import Order as _EngineOrder`.
-    3. Nothing else here should need to change -- that's the whole point
-       of coding against the interface instead of some hardcoded class.
+Now wired up to the real engine -- engine.Order, engine.Trade, and
+engine.next_order_id are the real deal, not a shim anymore.
 """
 
 from __future__ import annotations
 
-import itertools
-from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+from engine import Order, Trade, next_order_id
 
 from strategy.base import BookSnapshot, ExecutionClient, Fill, Side
 
 
-# ---------------------------------------------------------------------------
-# Shim -- delete once engine/order.py (and engine/__init__.py, once that
-# exists too) shows up on this branch.
-#
-# IMPORTANT -- this is exactly the piece that needs to change carefully.
-# The original version of this file used a PRIVATE itertools.count(1) on
-# EngineExecutionClient itself. That's a real bug: engine/order.py already
-# defines a shared next_order_id() specifically so every order in the
-# system pulls from ONE counter. Two independent counters that both start
-# at 1 will collide the instant they both feed orders into the same
-# OrderBook -- e.g. a historical order gets id 1, then our own first
-# submit_order() also generates id 1, silently overwriting the historical
-# order's spot in order_locations. Cancelling "our" order 1 then cancels
-# the wrong thing, and the historical order is orphaned on the book with
-# no way to reference it again. No error, no warning -- it just quietly
-# does the wrong thing.
-#
-# Fix: route order id generation through one function, injected in here,
-# instead of a counter owned by this class. Once engine-core is merged:
-#   from engine import next_order_id
-#   EngineExecutionClient(order_book, holder, order_id_factory=next_order_id)
-# and make sure the historical data loader (Phase 2) calls next_order_id()
-# too, rather than reusing LOBSTER's raw order ids directly -- those
-# aren't guaranteed to avoid collision with ids generated on our side
-# either.
-# ---------------------------------------------------------------------------
-_local_id_counter = itertools.count(1)
-
-
-def _next_order_id_shim() -> int:
-    """
-    Local stand-in for engine.next_order_id(). This is module-level (not
-    per-instance), so multiple EngineExecutionClient objects in the same
-    process at least won't collide with EACH OTHER by default -- but it's
-    still a separate counter from anything else in the system (e.g. a
-    data loader) until everyone's wired up to the real shared one. Delete
-    this once engine-core is merged in and pass the real next_order_id as
-    order_id_factory instead.
-    """
-    return next(_local_id_counter)
-
-
-@dataclass
-class _EngineOrder:
-    id: int
-    side: str
-    price: float
-    quantity: int
-    timestamp: int
-
-
 @runtime_checkable
 class OrderBookProtocol(Protocol):
-    """Whatever engine-core's real OrderBook ends up being, it needs to at least do this."""
+    """Structural contract for engine.OrderBook -- kept even now that the
+    real import exists, since it's still useful for tests (FakeOrderBook)
+    and keeps this file from hard-depending on the concrete class."""
 
     def add_limit_order(self, order: Any) -> list: ...
     def cancel_order(self, order_id: int) -> bool: ...
@@ -129,7 +55,7 @@ class EngineExecutionClient(ExecutionClient):
         self,
         order_book: OrderBookProtocol,
         strategy_ref_holder: list,
-        order_id_factory=_next_order_id_shim,
+        order_id_factory=next_order_id,
     ):
         self._book = order_book
         self._strategy_holder = strategy_ref_holder
@@ -140,7 +66,7 @@ class EngineExecutionClient(ExecutionClient):
 
     def submit_order(self, side: Side, price: float, qty: float) -> str:
         order_id = self._next_order_id()
-        order = _EngineOrder(
+        order = Order(
             id=order_id,
             side=side.value,
             price=price,
